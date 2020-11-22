@@ -1,0 +1,1093 @@
+---
+title: "Stock_ETM_France"
+author: "Thomas Loiseau"
+date: "17/09/2020"
+output:   
+  html_document:
+   toc: yes
+   toc_float: true
+   fig_heigth: 8
+   fig_width: 8
+   code_folding: hide
+---
+*Unitees* : 
+- ETM : mg/kg
+- Densitee apparentes : g/m3
+
+```{r packages, message = FALSE, warning=FALSE, include=FALSE, echo=FALSE}
+library(RODBC)
+library(dplyr)
+library(tidyr)
+library(plotly)
+library(raster)
+library(rgdal)
+library(DBI)
+library(rpostgis)
+library(RPostgreSQL)
+library(stringi)
+library(stringr)
+library(glue)
+library(ggplot2)
+library(reshape2)
+library(forcats)
+library(stats)
+library(xlsx)
+library(spcosa)
+library(gstat)
+library(soiltexture)
+library(sf)
+library(mapview)
+library(doParallel)
+library(foreach)
+library(knitr)
+library(kableExtra)
+library(psych)
+library(viridis)
+
+knitr::opts_chunk$set(cache = F)
+```
+
+# Contextes et objectifs
+
+Cette etude consiste a valoriser les donnees sur les Elements Traces Metalliques (ETM) issues de la premiere campagne (2000-2009) du Reseau de Mesure et de la Qualite des Sols (RMQS). Pour ce faire, plusieurs voies ont ete considerees, en commencant par une etude statistique sur les deux couches d'analyse du RMQS (H1 : 0-30 cm et H2 : 30-50cm) en utilisant les ETM selectionnes : Arsenic, Cadmium, Chrome, Cuivre, Cobalte, Molybdene, Nickel, Plomb et Zinc.
+
+Les differentes pistes abordees sont les suivantes : 
+
+  - Analyse exploratoire entre H1 et H2 pour tout les ETM possedant l'information sur les deux couches.
+  - Etude et spatialisation des concentration en ETM sur la France metropolitaine.
+  - Calcul des stocks totaux pour s'absoudre de la variabilite sur la profondeur de H2.
+  - Cartographie des stocks totaux et des concentrations sur H1 et sur H2.
+  - Spatialisation de l'information stock total pour la prise en compte du support variable des observations (profondeurs variables sur H2)
+ 
+
+```{r set workdirectory, message = FALSE, warning=FALSE,include=FALSE, echo=FALSE}
+
+#Workdirectory
+Workdir <- "D:/WorkSpace/ETM/Propre/" 
+setwd(Workdir)
+
+# Dossier stock totaux (H1 + H2)
+dir.create(paste0(Workdir,"Stock",sep=""))
+StockDirectory=paste0(Workdir,"Stock",sep="")
+
+# Identifiant 
+ID <- "tloiseau"
+MDP <- "GSM.Teledec.1"
+
+# injection des donnees
+data_ETM <- read.csv2(paste0(Workdir,"/donnees_ETM.csv"))
+
+# Connection a la base de donnees
+connection=RODBC::odbcConnect("dela")
+
+# Commande SQL pour l'interogation de la base
+retot <- "select*
+from dm_donnees_ponctuelles.synthese_analyses_rmqs_composites_hz
+where no_campagne='1' and x_reel is not null and site_officiel = TRUE and length(code_dept) <3;"
+
+no_cellule <- sqlQuery(connection,retot)
+
+```
+
+## Extraction des donnees volumetriques
+
+Dans le but d'obtenir une version plus recente de la table analyse volumetrique ponderee present dans l'entrepot (la derniere version datant de 2011), une extraction est effectuee sur la derniere version de la table mesures_echantillons_volumetriques du schema dm_donnees_ponctuelles. Cette table contient l'integralite des estimations massiques en elements grossiers (cailloux et graviers), en terre fine, le volume de l'echantillon...
+
+Encore une fois, cette extraction est realisee uniquement sur les echantillons composites de la campagne 1. Deplus, les observations presentant des anomalies sont filtrees : Sites ne respectant pas la convention de prelevement par couche RMQS (prelevement par horizons de sol), observations avec une profondeur en sommet >50cm...
+
+De plus, les echantillons preleves dans le cadre du projet BIOSOL n'ayant pas de donnees volumetriques pour la couche 2 (30-50cm), ne presente pas de stock ETM total. Neansmoins, un stock est calcule sur la couche 1 comme pour les autres points du RMQS.
+
+Dans un soucis de simplification, et en attendant la mise a jour officielle des donnees ponderres de l'entrepot, les variables necessaires au calcul des stocks en ETM ont ete estimees comme suit :
+
+### Elements grossiers
+
+$$Eg = (graviers+cailloux)/masse~seche\times100 $$
+Avec Eg le pourcentage en elements grossiers dans l'echantillon seche selon le rapport de la masse cumulee des fractions en elements grossiers presant dans l'echantillon.
+
+
+```{r Mise au propre da, message = FALSE, warning=FALSE}
+
+# Commande SQL pour l'extraction des donnees volumetriques
+connection=RODBC::odbcConnect("dela")
+
+req_vol <- "SELECT id_campagne, id_site, type_profil_rmqs, no_horizon, no_prelevement, 
+prof_sup_moy, prof_inf_moy, prof_sommet, prof_base, id_analyse, 
+eg_graviers_masse as masse_eg_graviers,  
+eg_cailloux_masse as masse_eg_cailloux,  da_volume_total as volume, 
+da_masse_humide as masse_humide, da_masse_seche as masse_seche,  
+da_no_methode, round((da_masse_seche/da_volume_total),2) as densite_apparente, round(( (eg_graviers_masse + eg_cailloux_masse) /da_masse_seche * 100 ), 2) as teneur_eg, round(((da_masse_humide-da_masse_seche)/da_masse_seche * 100), 2) as teneur_eau
+FROM dm_donnees_ponctuelles.mesures_echantillons_volumetriques_rmqs 
+where id_campagne in ('1') and round((da_masse_seche/da_volume_total),2) is not null and type_profil_rmqs = 'C'
+--and numero_annee_rmqs2 = '4'
+
+--and region_partenaire ilike '%PACA%'
+
+order by id_site, no_horizon, prof_sommet "
+
+data_vol_tot <- sqlQuery(connection,req_vol)
+
+odbcClose(connection) # fct de fermeture de la connection
+
+# Nettoyage des donnees aberantes
+Id_h3 <- unique(data_vol_tot[which(data_vol_tot$no_horizon%in%c(3,4,5,6,7,8)),"id_site"])
+data_vol_tot_h3 <- data_vol_tot[which(data_vol_tot$id_site%in%Id_h3),]
+data_vol_tot <- data_vol_tot[-which(data_vol_tot$id_site%in%Id_h3),]
+
+data_vol_tot <- data_vol_tot[-which(data_vol_tot$prof_sommet>50),]
+
+# Ponderation par id_site et par horizon (h1 - h2 - h9)
+data_EG <- NULL
+for(i in unique(data_vol_tot$id_site)){# traitement des donnees vol par site
+
+    dupli_ETM <- data_vol_tot[which(data_vol_tot$id_site==i),]
+  
+  for(hh in unique(dupli_ETM$no_horizon)){# traitement des donnee par hz
+    
+    dupli_ETM_hz <- dupli_ETM[which(dupli_ETM$no_horizon==hh),]
+
+    recap_meth <- as.data.frame(table(dupli_ETM_hz$da_no_methode))# Observation du nombre de methode dans l'horizon selectionne
+    
+    if(nrow(recap_meth)>1){# si plusieurs methode appliquee
+    
+     if(nrow(recap_meth[which(recap_meth$Var1==0.1),])>0){# On enleve les methode non identifie
+        
+        recap_meth <-  recap_meth[-which(recap_meth$Var1==0.1),]
+
+      }
+      
+      if(hh==1 && c(2)%in%unique(dupli_ETM$no_horizon)){# Condition pour sauvegarder une continuite de la methode entre h1 et h2
+        
+        recap_meth <- as.data.frame(table(dupli_ETM[which(dupli_ETM$no_horizon==2),]$da_no_methode))
+        
+      }else if(hh==2){
+        
+        recap_meth <- as.data.frame(table(data_EG[which(data_EG$no_horizon==1 & data_EG$id_site==i),]$no_methode))# respect de la continuite entre l'horizon h2 et l'horizon h1
+        
+      }
+        
+        if(length(unique(dupli_ETM$no_horizon))==1){
+        
+        recap_meth <- recap_meth[1,]
+      }
+      
+      
+      dupli_ETM_hz <- dupli_ETM_hz[which(dupli_ETM_hz$da_no_methode==recap_meth[which(recap_meth$Freq==max(recap_meth$Freq)),1]),]
+    
+    }
+    
+    # Sauvegarde des epaisseur des echantillons volumetriques
+     Data_h_site <- as.data.frame(i)
+    colnames(Data_h_site) <- "id_site"
+    Data_h_site$no_horizon <-hh
+    Data_h_site$prof_sommet <- ifelse(is.na(sum(dupli_ETM_hz$prof_sommet)),min(na.omit(dupli_ETM_hz$prof_inf_moy)), min(na.omit(dupli_ETM_hz$prof_sommet)))
+    Data_h_site$prof_base <- ifelse(is.na(sum(dupli_ETM_hz$prof_base)),min(na.omit(dupli_ETM_hz$prof_sup_moy)), max(na.omit(dupli_ETM_hz$prof_base)))
+   
+    Data_h_site$EG_pond <- (sum(na.omit(dupli_ETM_hz$masse_eg_graviers))+sum(na.omit(dupli_ETM_hz$masse_eg_cailloux)))/sum(na.omit(dupli_ETM_hz$masse_seche))*100
+    Data_h_site$DA_pond <- sum(na.omit(dupli_ETM_hz$masse_seche))/sum(na.omit(dupli_ETM_hz$volume))
+    Data_h_site$no_methode <- unique(dupli_ETM_hz$da_no_methode)
+    
+        data_EG <- rbind(data_EG,Data_h_site)
+  }
+ 
+  
+}
+
+
+data_ETM <- data_ETM[complete.cases(data_ETM$x_reel,data_ETM$y_reel),]
+
+# Filtre les doublon de la table densite apparente
+data_ETM$no_horizon <- as.numeric(as.character(data_ETM$no_horizon))
+data_ETM <- left_join(data_ETM,data_EG,by=c("id_site"="id_site","no_horizon"="no_horizon"))
+
+colnames(data_ETM)[87] <- "DA"
+colnames(data_ETM)[86]<- "abondance_eg"
+
+# Save data
+write.csv2(data_vol_tot,paste0(Workdir,"/ETM_volumetrique_traitees.csv"))
+write.csv2(data_ETM, paste0(Workdir,"/ETM_DA_pred_TOT.csv"), 
+           row.names = FALSE)
+```
+
+```{r carte Eg, message = FALSE, warning=FALSE}
+# Importation du shapefile France
+load("D:/WorkSpace/decoupage_administratif/france_entiere/bd_topo/contour_france.RData")
+
+# Horizon 1
+da_H1 <- data_ETM %>% filter(no_horizon == 1)%>%dplyr::select(abondance_eg)
+mybreaks1 <- unique(round(unname(quantile(na.omit(da_H1$abondance_eg))),3))
+
+ggplot() + 
+      geom_polygon(data=FceMetCorse_coord, aes(long,lat, group = group), fill= "gray82", colour="grey") +
+      coord_equal() +
+      geom_point(data = data_ETM%>% filter(no_horizon == 1) , 
+                 aes(x = x_reel, y = y_reel, size = abondance_eg,color=abondance_eg),shape=20, stroke=FALSE)+
+   scale_size_continuous(name="Element grossiers H1 (%)",breaks = mybreaks1,range=c(0.1,3.5))+
+   scale_color_viridis(name="Element grossiers H1 (%)",breaks = mybreaks1)+
+    theme_void() + 
+ guides( colour = guide_legend()) + 
+  theme(legend.position = "right")
+
+# Horizon 2
+da_H2 <- data_ETM %>% filter(no_horizon == 2)%>%dplyr::select(abondance_eg)
+mybreaks2 <- unique(round(unname(quantile(na.omit(da_H2$abondance_eg))),3))
+
+ggplot() + 
+      geom_polygon(data=FceMetCorse_coord, aes(long,lat, group = group), fill= "gray82", colour="grey") +
+      coord_equal() +
+      geom_point(data = data_ETM %>% filter(no_horizon == 2), 
+                 aes(x = x_reel, y = y_reel, size = abondance_eg,color=abondance_eg),shape=20, stroke=FALSE)+
+   scale_size_continuous(name="Element grossiers H2 (%)",breaks = mybreaks2,range=c(0.1,3.5))+
+   scale_color_viridis(name="Element grossiers H2 (%)",breaks = mybreaks2)+
+    theme_void() + 
+ guides( colour = guide_legend()) + 
+  theme(legend.position = "right")
+
+```
+
+### Densite apparente
+
+$$Da = massse~seche/volume~total $$ 
+Avec Da la densite apparente corespondant a la masse seche de l'echantillon par rapport a son volume total.
+
+```{r carte Da, message = FALSE, warning=FALSE}
+# Horizon 9
+da_H9 <- data_ETM %>% filter(no_horizon == 9)%>%dplyr::select(DA)
+mybreaks9 <- unique(round(unname(quantile(na.omit(da_H9$DA))),3))
+
+ggplot() + 
+      geom_polygon(data=FceMetCorse_coord, aes(long,lat, group = group), fill= "gray82", colour="grey") +
+      coord_equal() +
+      geom_point(data = data_ETM%>% filter(no_horizon == 9) , 
+                 aes(x = x_reel, y = y_reel, size = DA,color=DA),shape=20, stroke=FALSE)+
+   scale_size_continuous(name="Densitee apparente H9 (g/cm3)",breaks = mybreaks9,range=c(0.1,3.5))+
+   scale_color_viridis( name="Densitee apparente H9 (g/cm3)",breaks = mybreaks9)+
+    theme_void() + 
+ guides( colour = guide_legend()) + 
+  theme(legend.position = "right")
+
+# Horizon 1
+da_H1 <- data_ETM %>% filter(no_horizon == 1)%>%dplyr::select(DA)
+mybreaks1 <- unique(round(unname(quantile(na.omit(da_H1$DA))),3))
+
+ggplot() + 
+      geom_polygon(data=FceMetCorse_coord, aes(long,lat, group = group), fill= "gray82", colour="grey") +
+      coord_equal() +
+      geom_point(data = data_ETM%>% filter(no_horizon == 1) , 
+                 aes(x = x_reel, y = y_reel, size = DA,color=DA),shape=20, stroke=FALSE)+
+   scale_size_continuous(name="Densitee apparente H1 (g/cm3)",breaks = mybreaks1,range=c(0.1,3.5))+
+   scale_color_viridis( name="Densitee apparente H1 (g/cm3)",breaks = mybreaks1)+
+    theme_void() + 
+ guides( colour = guide_legend()) + 
+  theme(legend.position = "right")
+
+# Horizon 2
+da_H2 <- data_ETM %>% filter(no_horizon == 2)%>%dplyr::select(DA)
+mybreaks2 <-unique(round(unname(quantile(na.omit(da_H2$DA))),3))
+
+ggplot() + 
+      geom_polygon(data=FceMetCorse_coord, aes(long,lat, group = group), fill= "gray82", colour="grey") +
+      coord_equal() +
+      geom_point(data = data_ETM %>% filter(no_horizon == 2), 
+                 aes(x = x_reel, y = y_reel, size = DA,color=DA),shape=20, stroke=FALSE)+
+   scale_size_continuous(name="Densitee apparente H2 (g/cm3)",breaks = mybreaks2,range=c(0.1,3.5))+
+   scale_color_viridis(name="Densitee apparente H2 (g/cm3)",breaks = mybreaks2)+
+    theme_void() + 
+ guides( colour = guide_legend()) + 
+  theme(legend.position = "right")
+
+
+```
+
+# Calcul des stocks
+
+Dans un soucis de transformation des unitees, nous utilisons la donnees DA, originellement en g/cm3, en kg/cm3.
+De plus, nous calculons l'epaisseur de chaque horizon a partir de la profondeur superieur et inferieur de l'horizon que nous gardons en cm.
+
+```{r Stocks ETM, message = FALSE, warning=FALSE}
+# Preparation de la donnee
+data_ETM$DA <- data_ETM$DA/1000 # g/cm3 en kg/cm3
+data_ETM$Epaisseur <- abs(data_ETM$profondeur_hz_inf-data_ETM$profondeur_hz_sup) #calcul des epaisseurs en cm
+
+# Function Recap
+Stock_calc <- function(df,ETM,colout){
+  
+  df[,colout] <- ifelse(is.na(df$abondance_eg),
+                        df[,ETM]*df$Epaisseur*df$DA,# H9
+                        df[,ETM]*df$Epaisseur*(1-(df$abondance_eg/100))*df$DA) # H1 et H2 mg/cm2
+  df[,colout] <- df[,colout]*10000 # mg/m2
+  
+  return(df)
+}
+
+ETM.base <-c("as_tot_hf","cd_tot_hf","co_tot_hf","cr_tot_hf_RMQS","cr_tot_hf_RMQS1Bis","cu_tot_hf","ni_tot_hf",
+             "pb_tot_hf","zn_tot_hf","mo_tot_hf","cd_ext_edta","cr_ext_edta","ni_ext_edta","pb_ext_edta","zn_ext_edta",
+             "cu_ext_edta") 
+St.ETM <- c("Stock_as_hf","Stock_cd_hf","Stock_co_hf","Stock_cr_hf_RMQS","Stock_cr_hf_RMQS1Bis","Stock_cu_hf",
+            "Stock_ni_hf",
+            "Stock_pb_hf","Stock_zn_hf","Stock_mo_hf","Stock_cd_edta","Stock_cr_edta","Stock_ni_edta","Stock_pb_edta","Stock_zn_edta",
+            "Stock_cu_edta") 
+
+# Calcul des stock par horizon
+for( j in 1:length(ETM.base)){
+  
+  data_ETM <- Stock_calc(data_ETM,ETM.base[j],St.ETM[j])
+  
+}
+
+write.csv2(data_ETM, paste0(Workdir,"/Stock_ETM_data.csv"), 
+           row.names = FALSE)
+
+```
+
+Nous pouvons observer la variabilite de cette epaisseur pour chaque horizon :
+
+```{r carte Ep, message = FALSE, warning=FALSE}
+# Epaisseur
+mybreaks1 <- unique(unname(quantile(na.omit(data_ETM[which(data_ETM$no_horizon==1),"Epaisseur"])))[1:5])
+mybreaks2 <- unique(unname(quantile(na.omit(data_ETM[which(data_ETM$no_horizon==2),"Epaisseur"])))[1:5])
+mybreaks9 <- unique(unname(quantile(na.omit(data_ETM[which(data_ETM$no_horizon==9),"Epaisseur"])))[1:5])
+
+# H1
+ggplot() + 
+      geom_polygon(data=FceMetCorse_coord, aes(long,lat, group = group), fill= "gray82", colour="grey") +
+      coord_equal() +
+      geom_point(data = data_ETM %>% filter(no_horizon == 1) , 
+                 aes(x = x_reel, y = y_reel, size = Epaisseur,color=Epaisseur),shape=20, stroke=FALSE)+
+   scale_size_continuous(name="Epaisseur H1 (cm)",breaks = mybreaks1,range=c(0.1,3.5))+
+   scale_color_viridis(trans="log", name="Epaisseur H1 (cm)",breaks = mybreaks1)+
+    theme_void() + 
+ guides( colour = guide_legend()) + 
+  theme(legend.position = "right")
+
+# H2
+ggplot() + 
+      geom_polygon(data=FceMetCorse_coord, aes(long,lat, group = group), fill= "gray82", colour="grey") +
+      coord_equal() +
+      geom_point(data = data_ETM %>% filter(no_horizon == 2) , 
+                 aes(x = x_reel, y = y_reel, size = Epaisseur,color=Epaisseur),shape=20, stroke=FALSE)+
+   scale_size_continuous(name="Epaisseur H2 (cm)",breaks = mybreaks2,range=c(0.1,3.5))+
+   scale_color_viridis(trans="log", name="Epaisseur H2 (cm)",breaks = mybreaks2)+
+    theme_void() + 
+ guides( colour = guide_legend()) + 
+  theme(legend.position = "right")
+
+# H9
+ggplot() + 
+      geom_polygon(data=FceMetCorse_coord, aes(long,lat, group = group), fill= "gray82", colour="grey") +
+      coord_equal() +
+      geom_point(data = data_ETM %>% filter(no_horizon == 9) , 
+                 aes(x = x_reel, y = y_reel, size = Epaisseur,color=Epaisseur),shape=20, stroke=FALSE)+
+   scale_size_continuous(name="Epaisseur H9 (cm)",breaks = mybreaks9,range=c(0.1,3.5))+
+   scale_color_viridis(trans="log", name="Epaisseur H9 (cm)",breaks = mybreaks9)+
+    theme_void() + 
+ guides( colour = guide_legend()) + 
+  theme(legend.position = "right")
+
+```
+
+Afin de s'absoudre de l'heterogeneite des epaisseurs dans les donnees au sein des horizons, pour la spatialisation, nous avons choisis de calculer le stock total pour chaque ETM en cumulant les stocks de chaque couche (H1+H2+H9) :
+
+$$\sum_{i=1}^n Stock_i = C_i  \times Ep_i \times (1-Eg/100)  \times Da_i$$
+
+Avec C la teneur en ETM, Ep l'epaisseur de l'horizon, Eg le pourcentage d'elements grossiers et Da la densitee apparente.
+
+## Cartogramme des stocks
+
+Les cartogrammes presentes ci-dessous sont etablie a partir des coordonnees theoriques des points RMQS et ne correspondent pas a leur possition GPS reelle. 
+
+```{r Stocks save, message = FALSE, warning=FALSE}
+
+# CADMIUM
+Stock_cd_HF <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>%
+  dplyr::summarise(Sum_stock_cd_hf = sum(Stock_cd_hf))%>%
+  as.data.frame()
+
+mybreaks1 <- unique(round(unname(quantile(na.omit(Stock_cd_HF[,"Sum_stock_cd_hf"]))),3))
+
+test <- Stock_cd_HF%>%dplyr::select(x_theo,y_theo,Sum_stock_cd_hf)%>%
+  sf::st_as_sf(coords = c("x_theo","y_theo"), crs = 2154)%>%na.omit()%>%
+  mapview(zcol = "Sum_stock_cd_hf",layer.name = c("Stock Cadmium Total mg/m2"),cex="Sum_stock_cd_hf",at=mybreaks1,burst=FALSE, alpha = 0.5 )
+
+Stock_cd_EDTA <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>% 
+  dplyr::summarise(Sum_stock_cd_edta = sum(Stock_cd_edta))%>%
+  as.data.frame()
+
+save(Stock_cd_HF,file=paste0(StockDirectory,"/Stock_cd_HF.RData"))
+save(Stock_cd_EDTA,file=paste0(StockDirectory,"/Stock_cd_EDTA.RData"))
+
+# COBALTE
+Stock_co_HF <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>%
+  dplyr::summarise(Sum_stock_co_hf = sum(Stock_co_hf))%>%
+  as.data.frame()
+
+mybreaks2 <- unique(round(unname(quantile(na.omit(Stock_co_HF[,"Sum_stock_co_hf"]))),3))
+
+test2 <- Stock_co_HF%>%dplyr::select(x_theo,y_theo,Sum_stock_co_hf)%>%
+  sf::st_as_sf(coords = c("x_theo","y_theo"), crs = 2154)%>%na.omit()%>%
+  mapview(zcol = "Sum_stock_co_hf",layer.name = c("Stock Cobalte Total mg/m2"),cex="Sum_stock_co_hf",at=mybreaks2,burst=FALSE, alpha = 0.5 )
+
+save(Stock_co_HF,file=paste0(StockDirectory,"/Stock_co_HF.RData"))
+
+# CHROME
+Stock_cr_edta <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>% 
+  dplyr::summarise(Sum_stock_cr_edta = sum(Stock_cr_edta))%>%
+  as.data.frame()
+
+Stock_cr_hf_RMQS <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>% 
+  dplyr::summarise(Sum_stock_cr_hf_RMQS1 = sum(Stock_cr_hf_RMQS))%>%
+  as.data.frame()
+
+mybreaks3 <- unique(round(unname(quantile(na.omit(Stock_cr_hf_RMQS[,"Sum_stock_cr_hf_RMQS1"]))),3))
+
+test3 <- Stock_cr_hf_RMQS%>%dplyr::select(x_theo,y_theo,Sum_stock_cr_hf_RMQS1)%>%
+  sf::st_as_sf(coords = c("x_theo","y_theo"), crs = 2154)%>%na.omit()%>%
+  mapview(zcol = "Sum_stock_cr_hf_RMQS1",layer.name = c("Stock Chrome Total mg/m2"),cex="Sum_stock_cr_hf_RMQS1",at=mybreaks3,burst=FALSE, alpha = 0.5 )
+
+
+save(Stock_cr_edta,file=paste0(StockDirectory,"/Stock_cr_edta.RData"))
+save(Stock_cr_hf_RMQS,file=paste0(StockDirectory,"/Stock_cr_hf_RMQS.RData"))
+
+# CHROME 1 et 1Bis
+Stock_cr_hf_RMQS1<- data_ETM[which(data_ETM$no_horizon==1),
+                             c("id_site","x_reel","y_reel","occupation","type_sol2","domaine_geo","Stock_cr_hf_RMQS")] 
+Stock_cr_hf_RMQS1Bis<- data_ETM[which(data_ETM$no_horizon==1),
+                             c("id_site","x_reel","y_reel","occupation","type_sol2","domaine_geo","Stock_cr_hf_RMQS1Bis")] 
+
+save(Stock_cr_hf_RMQS1,file=paste0(StockDirectory,"/Stock_cr_hf_RMQS1.RData"))
+save(Stock_cr_hf_RMQS1Bis,file=paste0(StockDirectory,"/Stock_cr_hf_RMQS1Bis.RData"))
+
+# CUIVRE
+Stock_cu_HF <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>%
+  dplyr::summarise(Sum_stock_cu_hf = sum(Stock_cu_hf))%>%
+  as.data.frame()
+
+mybreaks4 <- unique(round(unname(quantile(na.omit(Stock_cu_HF[,"Sum_stock_cu_hf"]))),3))
+
+test4 <- Stock_cu_HF%>%dplyr::select(x_theo,y_theo,Sum_stock_cu_hf)%>%
+  sf::st_as_sf(coords = c("x_theo","y_theo"), crs = 2154)%>%na.omit()%>%
+  mapview(zcol = "Sum_stock_cu_hf",layer.name = c("Stock Cuivre Total mg/m2"),cex="Sum_stock_cu_hf",at=mybreaks4,burst=FALSE, alpha = 0.5 )
+
+Stock_cu_EDTA <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>% 
+  dplyr:: summarise(Sum_stock_cu_edta = sum(Stock_cu_edta))%>%
+  as.data.frame()
+
+save(Stock_cu_HF,file=paste0(StockDirectory,"/Stock_cu_HF.RData"))
+save(Stock_cu_EDTA,file=paste0(StockDirectory,"/Stock_cu_EDTA.RData"))
+
+# MOLYBDENE
+Stock_mo_HF <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>%
+  dplyr::summarise(Sum_stock_mo_hf = sum(Stock_mo_hf))%>%
+  as.data.frame()
+
+mybreaks5 <- unique(round(unname(quantile(na.omit(Stock_mo_HF[,"Sum_stock_mo_hf"]))),3))
+
+test5 <- Stock_mo_HF%>%dplyr::select(x_theo,y_theo,Sum_stock_mo_hf)%>%
+  sf::st_as_sf(coords = c("x_theo","y_theo"), crs = 2154)%>%na.omit()%>%
+  mapview(zcol = "Sum_stock_mo_hf",layer.name = c("Stock Molybdene Total mg/m2"),cex="Sum_stock_mo_hf",at=mybreaks5,burst=FALSE, alpha = 0.5 )
+
+
+save(Stock_mo_HF,file=paste0(StockDirectory,"/Stock_mo_HF.RData"))
+
+# PLOMB
+Stock_pb_HF <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>%
+  dplyr::summarise(Sum_stock_pb_hf = sum(Stock_pb_hf))%>%
+  as.data.frame()
+
+mybreaks6 <- unique(round(unname(quantile(na.omit(Stock_pb_HF[,"Sum_stock_pb_hf"]))),3))
+
+test6 <- Stock_pb_HF%>%dplyr::select(x_theo,y_theo,Sum_stock_pb_hf)%>%
+  sf::st_as_sf(coords = c("x_theo","y_theo"), crs = 2154)%>%na.omit()%>%
+  mapview(zcol = "Sum_stock_pb_hf",layer.name = c("Stock Plomb Total mg/m2"),cex="Sum_stock_pb_hf",at=mybreaks6,burst=FALSE, alpha = 0.5 )
+
+
+Stock_pb_EDTA <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>% 
+  dplyr::summarise(Sum_stock_pb_edta = sum(Stock_pb_edta))%>%
+  as.data.frame()
+
+save(Stock_pb_HF,file=paste0(StockDirectory,"/Stock_pb_HF.RData"))
+save(Stock_pb_EDTA,file=paste0(StockDirectory,"/Stock_pb_EDTA.RData"))
+
+# ZINC
+Stock_zn_HF <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>%
+  dplyr::summarise(Sum_stock_zn_hf = sum(Stock_zn_hf))%>%
+  as.data.frame()
+
+mybreaks7 <- unique(round(unname(quantile(na.omit(Stock_zn_HF[,"Sum_stock_zn_hf"]))),3))
+
+test7 <- Stock_zn_HF%>%dplyr::select(x_theo,y_theo,Sum_stock_zn_hf)%>%
+  sf::st_as_sf(coords = c("x_theo","y_theo"), crs = 2154)%>%na.omit()%>%
+  mapview(zcol = "Sum_stock_zn_hf",layer.name = c("Stock Zinc Total mg/m2"),cex="Sum_stock_zn_hf",at=mybreaks7,burst=FALSE, alpha = 0.5 )
+
+
+Stock_zn_EDTA <- data_ETM %>% 
+  group_by(id_site,x_reel,y_reel,x_theo,y_theo,occupation,type_sol2,domaine_geo) %>% 
+  dplyr::summarise(Sum_stock_zn_edta = sum(Stock_zn_edta))%>%
+  as.data.frame()
+
+save(Stock_zn_HF,file=paste0(StockDirectory,"/Stock_zn_HF.RData"))
+save(Stock_zn_EDTA,file=paste0(StockDirectory,"/Stock_zn_EDTA.RData"))
+
+test+test2+test3+test4+test5+test6+test7
+
+```
+
+## Statistique descriptive stocks totaux  par OCS
+
+```{r importation grille, message = FALSE, warning=FALSE,include=FALSE, echo=FALSE}
+
+# Importation des donnees et de la grille 
+source("Y:/Projets/SID/Scripts/StatistiquesRMQS/src/pedoTransferFunctions.lib.r")
+
+# Importation de la fonction d'etude statistique : samplingDesign2()
+source("Y:/Projets/SID/Scripts/StatistiquesRMQS/src/SamplingDesignv4.R")
+
+load("Y:/Projets/SID/Scripts/StatistiquesRMQS/grilleRMQS.RData")
+coordinates(grille) <- ~x+y
+gridded(grille) <- T
+```
+
+```{r Stocks ETM stat, message = FALSE, warning=FALSE}
+
+# Importation des donnees sources
+files.Rdata <- list.files(StockDirectory,pattern = paste0("Stock",".*",".RData$"))
+
+
+for(i in 1:length(files.Rdata)){
+ 
+  setwd(StockDirectory)
+  
+  Stock1 <- get(load(files.Rdata[i]))
+  
+  if(i==1){
+    
+    Stock_All <- Stock1
+    
+  }else{
+    
+    Stock_All <- left_join(Stock_All,Stock1[,c(1,ncol(Stock1))],by=c("id_site"))
+    
+  }
+  
+  
+}
+
+Stock_All <- as.data.frame(Stock_All)
+Stock_All <- Stock_All[-which(Stock_All$occupation=="foret"),]
+
+# Creation d'un niveau de facteur de la covariable nom_occupation pour le cas de toutes occupations confondues pour le jeu de donnees dataSet
+## Occupation
+tmp <- Stock_All
+tmp$occupation <- 'TtesOccupations'
+Stock_All <- rbind.data.frame(Stock_All , tmp)
+rm(tmp)
+
+levels(Stock_All$occupation)[nlevels(Stock_All$occupation)] <- c("Toute_occupation_sauf_foret")
+
+# Etudes statistiques relatives a la teneur en Elements chimiques ou  en grandeurs physico-chimique 
+
+Grandeur <- c("Sum_stock_cd_edta","Sum_stock_cd_hf","Sum_stock_co_hf",
+              "Sum_stock_cr_edta","Sum_stock_cr_hf_RMQS1",
+              "Sum_stock_cu_edta","Sum_stock_cu_hf",    
+              "Sum_stock_mo_hf","Sum_stock_pb_edta","Sum_stock_pb_hf","Sum_stock_zn_edta" ,"Sum_stock_zn_hf"     
+                  
+)
+
+# Preparation des commentaires qui accompagneront les tables generees dans la partie suivante
+
+GrandeurExplicite <- c("Stock total Cadmium EDTA","Stock total Cadmium HF","Stock total Cobalt HF","Stock total Chrome EDTA",
+                       "Stock total Chrome RMQS1 HF","Stock total Cuivre EDTA","Stock total Cuivre HF",
+                       "Stock total Molybdene HF","Stock total Plomb EDTA","Stock total Plomb HF","Stock total Zinc EDTA","Stock total Zinc HF")
+
+# Definition de la variables de regroupement pour les tables finales
+strateVar <- "occupation"
+Stock_All$occupation <- as.factor(Stock_All$occupation)
+levels(Stock_All$occupation) <- c("Culture permanente","Grande culture","Parc","Prairie","Sol nu","Toute occupation sauf foret","Vegetation naturelle","Zone humide")
+
+strates <- levels(Stock_All[, strateVar])
+
+Stock_All$no_horizon <- 1
+couches <- 1
+
+# Jointure du numero de cellule
+Stock_All <- left_join(Stock_All,no_cellule[,c(9,10)],by=c("id_site"))
+Stock_All <- Stock_All[-which(duplicated(Stock_All)),]
+colnames(Stock_All)[ncol(Stock_All)] <- "no_cellule"
+
+#setup parallel backend to use many processors
+cores = detectCores()
+cl <- makeCluster(3) #not to overload your computer
+registerDoParallel(cl)
+
+# #setup parallel backend to use many processors
+# cores = detectCores()
+# cl <- makeCluster(2) #not to overload your computer
+# registerDoParallel(cl)
+
+resufinal    <-
+  foreach(
+    i = 1:length(Grandeur) ,#31:33 ,#
+    .combine = rbind.data.frame,
+    .export = "samplingDesignStats",
+    .packages = c("sp", "spcosa", "foreach"),
+    .verbose=FALSE
+  ) %dopar% {
+    
+    
+    resucouche <- 
+      foreach(
+        j = 1:length(couches),
+        .combine = rbind.data.frame
+        
+      ) %do% {
+        s=1
+        resParOccup <- foreach(strate = strates[c(1,2,4,6,7)],
+                               .combine = rbind.data.frame
+        ) %do% {
+          
+          print(paste(
+            "Je traite ",
+            Grandeur[i],
+            "occupation",
+            strate,
+            " pour la couche" ,
+            couches[j],"----------------------------"
+          ))
+          
+          
+          maskCouche <- Stock_All$no_horizon == couches[j]
+          maskStrate <- Stock_All[, strateVar] == strate
+          maskNA <- !is.na(Stock_All[, Grandeur[i]] )
+          
+          if (sum(maskNA & maskCouche & maskStrate) > 30)  {
+            resL <-
+              samplingDesignStats(grille,
+                                  Stock_All[maskNA & maskCouche & maskStrate , c("no_cellule", Grandeur[i]) ], 
+                                  Grandeur[i])
+            #  elt = Grandeur[i]
+            # dataSetSav = dataSet
+            #  dataSet = dataSet[maskNA & maskCouche & maskStrate , c("no_cellule", Grandeur[i]) ] 
+            
+            resL <- as.data.frame(t(resL))
+            
+          } else {
+            resL <- as.data.frame(t(rep(NA,15)))
+            colnames(resL) <-  c("n_ind","Min","1stQuart","Median","Mean","3rdQu.","Max",
+                                 '1thDec','9thDec',
+                                 "Variance" , "se_mean_STSI",
+                                 "pcOutliers1.5","Vibrisse1.5","pcOutliers3","Vibrisse3")
+            
+          }
+          
+          
+          
+          cbind.data.frame(elt = GrandeurExplicite[i] ,couche = j, occup = strate , resL)
+          
+          
+        } # fin par occup
+        
+        resParOccup
+        
+      } # fin par couche
+    resucouche
+  } # fin par grandeur
+stopCluster(cl)
+
+# On sauve l'objet resufinal en cas de perte par ecrasementdes valeurs
+SauvegardeResuFinal <- resufinal
+
+# On ordonne les champs de la table resufinal
+resufinal <- resufinal[ , c(1:5 , 11 , 6:9 , 12 , 10 , 13 , 14,15:18)]
+
+# On renomme les champs de la table resufinal
+colnames(resufinal) <- c("Grandeur_RMQS" ,
+                         "Couche" ,
+                         "Occupation" ,
+                         "Effectif" ,
+                         "Minimum" ,
+                         "Premier_Decile" ,
+                         "Premier_Quartile" ,
+                         "Mediane" ,
+                         "Moyenne" ,
+                         "Troisieme_Quartile" ,
+                         "Neuvieme_Decile" ,
+                         "Maximum" ,
+                         "Variance" ,
+                         "Erreur_standard_STSI",
+                         "pcOutliers1.5","Vibrisse1.5","pcOutliers3","Vibrisse3"
+)
+
+# Creation de la table xls
+setwd(StockDirectory)
+write.csv2(resufinal , "Stat_occup_Stock_tot_ETMRMQS18092020_.csv", row.names = FALSE)
+
+kable(resufinal) %>%
+  add_header_above(c( "Statistique des stocks ETM (mg/m2) par occupation de sol" = 18))%>%
+  kable_styling(bootstrap_options = "striped", "bordered", full_width = F)%>%
+  scroll_box(width = "100%", height = "400px")
+
+```
+
+## Statistique descriptive du stocks totaux par domaine geologique
+
+```{r FE stat geol, message = FALSE, warning=FALSE}
+# Importation des donnees sources
+files.Rdata <- list.files(StockDirectory,pattern = paste0("Stock",".*",".RData$"))
+
+
+for(i in 1:length(files.Rdata)){
+ 
+  setwd(StockDirectory)
+  
+  Stock1 <- get(load(files.Rdata[i]))
+  
+  if(i==1){
+    
+    Stock_All <- Stock1
+    
+  }else{
+    
+    Stock_All <- left_join(Stock_All,Stock1[,c(1,ncol(Stock1))],by=c("id_site"))
+    
+  }
+  
+  
+}
+
+Stock_All <- as.data.frame(Stock_All)
+
+tmp <- Stock_All
+tmp$domaine_geo <- 'TtesGeol'
+Stock_All <- rbind.data.frame(Stock_All , tmp)
+rm(tmp)
+
+levels(Stock_All$domaine_geo)[nlevels(Stock_All$domaine_geo)] <- c("Toute_geol")
+
+# Définition de la variables de regroupement pour les tables finales
+strateVar <- "domaine_geo"
+Stock_All$domaine_geo <- as.factor(Stock_All$domaine_geo)
+levels(Stock_All$domaine_geo) <- c("Cristallin","Inconnu","Sedimentaire","Tourbiere","Tout domaine","Volcanique")
+
+strates <- levels(Stock_All[, strateVar])
+Stock_All$no_horizon <- 1
+
+couches <- 1
+
+# Jointure du numéro de cellule
+Stock_All <- left_join(Stock_All,no_cellule[,c(9,10)],by=c("id_site"))
+Stock_All <- Stock_All[-which(duplicated(Stock_All)),]
+colnames(Stock_All)[ncol(Stock_All)] <- "no_cellule"
+
+#setup parallel backend to use many processors
+cores = detectCores()
+cl <- makeCluster(3) #not to overload your computer
+registerDoParallel(cl)
+
+# #setup parallel backend to use many processors
+# cores = detectCores()
+# cl <- makeCluster(2) #not to overload your computer
+# registerDoParallel(cl)
+
+resufinal    <-
+  foreach(
+    i = 1:length(Grandeur) ,#31:33 ,#
+    .combine = rbind.data.frame,
+    .export = "samplingDesignStats",
+    .packages = c("sp", "spcosa", "foreach"),
+    .verbose=FALSE
+  ) %dopar% {
+    
+    
+    resucouche <- 
+      foreach(
+        j = 1:length(couches),
+        .combine = rbind.data.frame
+        
+      ) %do% {
+        s=1
+        resParOccup <- foreach(strate = strates[c(1,2,3,5,6)],
+                               .combine = rbind.data.frame
+        ) %do% {
+          
+          print(paste(
+            "Je traite ",
+            Grandeur[i],
+            "domaine_geo",
+            strate,
+            " pour la couche" ,
+            couches[j],"----------------------------"
+          ))
+          
+          
+          maskCouche <- Stock_All$no_horizon == couches[j]
+          maskStrate <- Stock_All[, strateVar] == strate
+          maskNA <- !is.na(Stock_All[, Grandeur[i]] )
+          
+          if (sum(maskNA & maskCouche & maskStrate) > 30)  {
+            resL <-
+              samplingDesignStats(grille,
+                                  Stock_All[maskNA & maskCouche & maskStrate , c("no_cellule", Grandeur[i]) ], 
+                                  Grandeur[i])
+            #  elt = Grandeur[i]
+            # dataSetSav = dataSet
+            #  dataSet = dataSet[maskNA & maskCouche & maskStrate , c("no_cellule", Grandeur[i]) ] 
+            
+            resL <- as.data.frame(t(resL))
+            
+          } else {
+            resL <- as.data.frame(t(rep(NA,15)))
+            colnames(resL) <-  c("n_ind","Min","1stQuart","Median","Mean","3rdQu.","Max",
+                                 '1thDec','9thDec',
+                                 "Variance" , "se_mean_STSI",
+                                 "pcOutliers1.5","Vibrisse1.5","pcOutliers3","Vibrisse3")
+            
+          }
+          
+          
+          
+          cbind.data.frame(elt = GrandeurExplicite[i] ,couche = couches[j], occup = strate , resL)
+          
+          
+        } # fin par occup
+        
+        resParOccup
+        
+      } # fin par couche
+    resucouche
+  } # fin par grandeur
+stopCluster(cl)
+
+# On sauve l'objet resufinal en cas de perte par écrasementdes valeurs
+SauvegardeResuFinal <- resufinal
+
+# On ordonne les champs de la table resufinal
+resufinal <- resufinal[ , c(1:5 , 11 , 6:9 , 12 , 10 , 13 , 14,15:18)]
+
+# On renomme les champs de la table resufinal
+colnames(resufinal) <- c("Grandeur_RMQS" ,
+                         "Couche" ,
+                         "Domaine geol" ,
+                         "Effectif" ,
+                         "Minimum" ,
+                         "Premier_Decile" ,
+                         "Premier_Quartile" ,
+                         "Mediane" ,
+                         "Moyenne" ,
+                         "Troisieme_Quartile" ,
+                         "Neuvieme_Decile" ,
+                         "Maximum" ,
+                         "Variance" ,
+                         "Erreur_standard_STSI",
+                         "pcOutliers1.5","Vibrisse1.5","pcOutliers3","Vibrisse3"
+)
+
+# Creation de la table xls
+resufinal <- na.omit(resufinal)
+setwd(StockDirectory)
+write.csv2(resufinal , "Stat_geol_Stock_tot_ETMRMQS18092020_.csv", row.names = FALSE)
+
+kable(resufinal) %>%
+  add_header_above(c( "Statistique des stocks ETM (mg/m2) par domaine geologique" = 19))%>%
+  kable_styling(bootstrap_options = "striped", "bordered", full_width = F)%>%
+scroll_box(width = "100%", height = "400px")
+```
+
+## Statistiques descriptives par region
+
+```{r FE stat region, message = FALSE, warning=FALSE}
+# Importation des donnees sources
+files.Rdata <- list.files(StockDirectory,pattern = paste0("Stock",".*",".RData$"))
+
+
+for(i in 1:length(files.Rdata)){
+ 
+  setwd(StockDirectory)
+  
+  Stock1 <- get(load(files.Rdata[i]))
+  
+  if(i==1){
+    
+    Stock_All <- Stock1
+    
+  }else{
+    
+    Stock_All <- left_join(Stock_All,Stock1[,c(1,ncol(Stock1))],by=c("id_site"))
+    
+  }
+  
+  
+}
+
+Stock_All <- as.data.frame(Stock_All)
+Stock_All <- dplyr::left_join(Stock_All,no_cellule[,c("id_site","code_dept")],by=c("id_site"))
+Stock_All <- Stock_All[-which(duplicated(Stock_All)),]
+
+Stock_All$Region <- ifelse(Stock_All$code_dept%in%c("29 ","22 ","56 ","35 "),"Bretagne",
+                        ifelse(Stock_All$code_dept%in%c("50 ","14 ","76 ","27 ","61 "),"Normandie",
+                               ifelse(Stock_All$code_dept%in%c("62 ","59 ","80 ","60 ","02 "),"Haut de France",
+                                      ifelse(Stock_All$code_dept%in%c("53 ","72 ","49 ","44 ","85 "),"Pays de la Loire",
+                                      ifelse(Stock_All$code_dept%in%c("95 ","78 ","91 ","77 ","75 ","93 ","92 ","94 "),"Ile de France",
+                                             ifelse(Stock_All$code_dept%in%c("28 ","45 ","41 ","37 ","36 ","18 "),"Centre val de Loire",
+                                                    ifelse(Stock_All$code_dept%in%c("79 ","86 ","87 ","23 ","19 ","17 ","16 ","24 ","33 ","47 ","40 ","64 "),
+                                                           "Nouvelle Aquitaine",
+                                                           ifelse(Stock_All$code_dept%in%c("08 ","51 ","10 ","55 ","52 ","57 ","54 ","88 ","67 ","68 "),
+                                                                  "Grand Est",
+                                                                  ifelse(Stock_All$code_dept%in%c("89 ","58 ","21 ","71 ","70 ","39 ","25 ","90 "),
+                                                                         "Bourgogne Franche Comte",
+                                                                         ifelse(Stock_All$code_dept%in%c("03 ","63 ","15 ","43 ","42 ","69 ","07 ","01 ",
+                                                                                                      "26 ","38 ","74 ","73 "),"Auvergne Rhone Alpes",
+                                                                                ifelse(Stock_All$code_dept%in%c("46 ","12 ","48 ","30 ","34 ","81 ",
+                                                                                                             "82 ","31 ","32 ","65 ","09 ","11 ","66 "),
+                                                                                       "Occitanie",
+                                                                                       ifelse(Stock_All$code_dept%in%c("84 ","05 ","04 ","06 ","83 ","13 "),
+                                                                                              "Provence Alpes Cote D'azur",
+                                                                                              ifelse(Stock_All$code_dept%in%c("2A ","2B "),"Corse",NA)))))))))))))
+
+
+
+tmp <- Stock_All
+tmp$Region <- 'France entiere'
+Stock_All <- rbind.data.frame(Stock_All , tmp)
+rm(tmp)
+
+levels(Stock_All$Region)[nlevels(Stock_All$Region)] <- c("France entiere")
+
+# Définition de la variables de regroupement pour les tables finales
+strateVar <- "Region"
+Stock_All$Region <- as.factor(Stock_All$Region)
+
+strates <- levels(Stock_All[, strateVar])
+Stock_All$no_horizon <- 1
+
+couches <- 1
+
+# Jointure du numéro de cellule
+Stock_All <- left_join(Stock_All,no_cellule[,c(9,10)],by=c("id_site"))
+Stock_All <- Stock_All[-which(duplicated(Stock_All)),]
+colnames(Stock_All)[ncol(Stock_All)] <- "no_cellule"
+
+#setup parallel backend to use many processors
+cores = detectCores()
+cl <- makeCluster(3) #not to overload your computer
+registerDoParallel(cl)
+
+# #setup parallel backend to use many processors
+# cores = detectCores()
+# cl <- makeCluster(2) #not to overload your computer
+# registerDoParallel(cl)
+
+resufinal    <-
+  foreach(
+    i = 1:length(Grandeur) ,#31:33 ,#
+    .combine = rbind.data.frame,
+    .export = "samplingDesignStats",
+    .packages = c("sp", "spcosa", "foreach"),
+    .verbose=FALSE
+  ) %dopar% {
+    
+    
+    resucouche <- 
+      foreach(
+        j = 1:length(couches),
+        .combine = rbind.data.frame
+        
+      ) %do% {
+        s=1
+        resParOccup <- foreach(strate = strates,
+                               .combine = rbind.data.frame
+        ) %do% {
+          
+          print(paste(
+            "Je traite ",
+            Grandeur[i],
+            "domaine_geo",
+            strate,
+            " pour la couche" ,
+            couches[j],"----------------------------"
+          ))
+          
+          
+          maskCouche <- Stock_All$no_horizon == couches[j]
+          maskStrate <- Stock_All[, strateVar] == strate
+          maskNA <- !is.na(Stock_All[, Grandeur[i]] )
+          
+          if (sum(maskNA & maskCouche & maskStrate) > 30)  {
+            resL <-
+              samplingDesignStats(grille,
+                                  Stock_All[maskNA & maskCouche & maskStrate , c("no_cellule", Grandeur[i]) ], 
+                                  Grandeur[i])
+            #  elt = Grandeur[i]
+            # dataSetSav = dataSet
+            #  dataSet = dataSet[maskNA & maskCouche & maskStrate , c("no_cellule", Grandeur[i]) ] 
+            
+            resL <- as.data.frame(t(resL))
+            
+          } else {
+            resL <- as.data.frame(t(rep(NA,15)))
+            colnames(resL) <-  c("n_ind","Min","1stQuart","Median","Mean","3rdQu.","Max",
+                                 '1thDec','9thDec',
+                                 "Variance" , "se_mean_STSI",
+                                 "pcOutliers1.5","Vibrisse1.5","pcOutliers3","Vibrisse3")
+            
+          }
+          
+          
+          
+          cbind.data.frame(elt = GrandeurExplicite[i] ,couche = couches[j], occup = strate , resL)
+          
+          
+        } # fin par occup
+        
+        resParOccup
+        
+      } # fin par couche
+    resucouche
+  } # fin par grandeur
+stopCluster(cl)
+
+# On sauve l'objet resufinal en cas de perte par écrasementdes valeurs
+SauvegardeResuFinal <- resufinal
+
+# On ordonne les champs de la table resufinal
+resufinal <- resufinal[ , c(1:5 , 11 , 6:9 , 12 , 10 , 13 , 14,15:18)]
+
+# On renomme les champs de la table resufinal
+colnames(resufinal) <- c("Grandeur_RMQS" ,
+                         "Couche" ,
+                         "Region" ,
+                         "Effectif" ,
+                         "Minimum" ,
+                         "Premier_Decile" ,
+                         "Premier_Quartile" ,
+                         "Mediane" ,
+                         "Moyenne" ,
+                         "Troisieme_Quartile" ,
+                         "Neuvieme_Decile" ,
+                         "Maximum" ,
+                         "Variance" ,
+                         "Erreur_standard_STSI",
+                         "pcOutliers1.5","Vibrisse1.5","pcOutliers3","Vibrisse3"
+)
+
+# Creation de la table xls
+resufinal <- na.omit(resufinal)
+setwd(StockDirectory)
+write.csv2(resufinal , "Stat_region_Stock_tot_ETMRMQS18092020_.csv", row.names = FALSE)
+
+kable(resufinal) %>%
+  add_header_above(c( "Statistique des stocks ETM (mg/m2) par region" = 19))%>%
+  kable_styling(bootstrap_options = "striped", "bordered", full_width = F)%>%
+scroll_box(width = "100%", height = "400px")
+
+
+```
